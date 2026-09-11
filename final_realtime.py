@@ -1,6 +1,8 @@
 import os
 import time
 import socket
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import joblib
@@ -12,12 +14,14 @@ from sklearn.ensemble import RandomForestClassifier
 # CONFIGURATION
 # ============================================================
 
+BASE_DIR = Path(__file__).resolve().parent
+
 FATIGUE_FEATURE_FILE = (
-    r"F:\SIH\FINAL_PIPELINE\data\imu_fatigue_features.csv"
+    BASE_DIR / "imu_fatigue_features.csv"
 )
 
 MODEL_FILE = (
-    r"F:\SIH\FINAL_PIPELINE\ML\fatigue_model.pkl"
+    BASE_DIR / "fatigue_model.pkl"
 )
 
 # ESP32 Wi-Fi Access Point
