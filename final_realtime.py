@@ -1,6 +1,6 @@
 import os
 import time
-import socket
+import serial
 from pathlib import Path
 
 import numpy as np
@@ -9,6 +9,7 @@ import joblib
 
 from sklearn.ensemble import RandomForestClassifier
 
+from firebase_service import write_telemetry
 
 # ============================================================
 # CONFIGURATION
@@ -24,12 +25,14 @@ MODEL_FILE = (
     BASE_DIR / "fatigue_model.pkl"
 )
 
-# ESP32 Wi-Fi Access Point
-ESP32_IP = "192.168.4.1"
-ESP32_PORT = 5000
+# ESP32 USB Serial connection
+SERIAL_PORT = "COM7"
+BAUD_RATE = 115200
 
 LIVE_MODE = True
-
+# Firebase prototype identifiers
+PATIENT_ID = "patient_001"
+DEVICE_ID = "device_001"
 
 # ============================================================
 # SENSOR CONFIGURATION
@@ -868,15 +871,14 @@ def assistance_to_controller(
 
 
 # ============================================================
-# WIFI DATA RECEIVING
+# USB SERIAL DATA RECEIVING
 # ============================================================
 
 def get_rh_window(
-    client_socket
+    serial_connection
 ):
-
     """
-    ESP32 sends:
+    ESP32 sends over USB Serial:
 
     RH,Timestamp,gx,gy,gz,ax,ay,az
 
@@ -887,111 +889,67 @@ def get_rh_window(
 
     buffer = []
 
-    data_buffer = b""
-
-
     while len(buffer) < WINDOW_SAMPLES:
 
         try:
-
-            data = client_socket.recv(
-                4096
+            line = (
+                serial_connection
+                .readline()
+                .decode(
+                    "utf-8",
+                    errors="ignore"
+                )
+                .strip()
             )
 
-            if not data:
+            if not line:
+                continue
 
-                raise ConnectionError(
-                    "ESP32 disconnected."
-                )
+            parts = line.split(",")
 
-            data_buffer += data
+            # Expected:
+            # RH + 7 numerical values
 
-
-            while (
-                b"\n" in data_buffer
-                and
-                len(buffer) < WINDOW_SAMPLES
+            if (
+                len(parts) != 8
+                or
+                parts[0] != "RH"
             ):
+                continue
 
-                line, data_buffer = (
-                    data_buffer.split(
-                        b"\n",
-                        1
+            try:
+
+                values = list(
+                    map(
+                        float,
+                        parts[1:]
                     )
                 )
 
-                line = (
-                    line
-                    .decode(
-                        "utf-8",
-                        errors="ignore"
-                    )
-                    .strip()
-                )
+                row = {
 
+                    "Time": values[0],
 
-                if not line:
+                    "Gyro X": values[1],
+                    "Gyro Y": values[2],
+                    "Gyro Z": values[3],
 
-                    continue
+                    "Accel X": values[4],
+                    "Accel Y": values[5],
+                    "Accel Z": values[6]
+                }
 
+                buffer.append(row)
 
-                parts = line.split(",")
+            except ValueError:
+                continue
 
+        except serial.SerialException as e:
+            raise ConnectionError(
+                f"ESP32 USB serial connection lost: {e}"
+            )
 
-                # Expected:
-                # RH + 7 numerical values
-
-                if (
-                    len(parts) != 8
-                    or
-                    parts[0] != "RH"
-                ):
-
-                    continue
-
-
-                try:
-
-                    values = list(
-                        map(
-                            float,
-                            parts[1:]
-                        )
-                    )
-
-
-                    row = {
-
-                        "Time": values[0],
-
-                        "Gyro X": values[1],
-                        "Gyro Y": values[2],
-                        "Gyro Z": values[3],
-
-                        "Accel X": values[4],
-                        "Accel Y": values[5],
-                        "Accel Z": values[6]
-                    }
-
-
-                    buffer.append(
-                        row
-                    )
-
-
-                except ValueError:
-
-                    continue
-
-
-        except socket.timeout:
-
-            continue
-
-
-    return pd.DataFrame(
-        buffer
-    )
+    return pd.DataFrame(buffer)
 
 
 # ============================================================
@@ -999,7 +957,7 @@ def get_rh_window(
 # ============================================================
 
 def send_to_microcontroller(
-    client_socket,
+    serial_connection,
     assistance_score,
     assistance_level,
     controller_command
@@ -1013,13 +971,16 @@ def send_to_microcontroller(
         f"{controller_command:.2f}\n"
     )
 
-
-    client_socket.sendall(
-        message.encode(
-            "utf-8"
+    try:
+        serial_connection.write(
+            message.encode("utf-8")
         )
-    )
+        serial_connection.flush()
 
+    except serial.SerialException as e:
+        raise ConnectionError(
+            f"Could not send assistance command to ESP32: {e}"
+        )
 
     print(
         "\n→ Sent to ESP32:",
@@ -1031,9 +992,14 @@ def send_to_microcontroller(
 # PROCESS ONE WINDOW
 # ============================================================
 
+
+# ============================================================
+# PROCESS ONE WINDOW
+# ============================================================
+
 def process_window(
     rh_window,
-    client_socket
+    serial_connection
 ):
 
     # ========================================================
@@ -1277,12 +1243,23 @@ def process_window(
     # ========================================================
 
     send_to_microcontroller(
-        client_socket,
+        serial_connection,
         assistance_score,
         assistance_level,
         controller_command
     )
+    return {
+        "fatigue_score": float(fatigue_score),
+        "fatigue_probability": float(fatigue_probability),
+        "fatigue_prediction": int(fatigue_prediction),
 
+        "stability_score": float(stability_score),
+        "stability_level": stability_level,
+
+        "assistance_score": float(assistance_score),
+        "assistance_level": assistance_level,
+        "controller_command": float(controller_command)
+    }
 
 # ============================================================
 # MAIN
@@ -1306,15 +1283,15 @@ def main():
     )
 
     print(
-        "  ESP32 Wi-Fi Access Point"
+    "  ESP32 USB Serial"
     )
 
     print(
-        f"  ESP32 IP        : {ESP32_IP}"
+    f"  COM Port        : {SERIAL_PORT}"
     )
 
     print(
-        f"  TCP Port        : {ESP32_PORT}"
+    f"  Baud Rate       : {BAUD_RATE}"
     )
 
 
@@ -1343,68 +1320,60 @@ def main():
     if LIVE_MODE:
 
         print("\n")
-
         print(
-            f"Connecting to ESP32 at "
-            f"{ESP32_IP}:{ESP32_PORT}..."
+            f"Connecting to ESP32 through USB Serial "
+            f"({SERIAL_PORT} @ {BAUD_RATE} baud)..."
         )
-
-
-        client_socket = socket.socket(
-            socket.AF_INET,
-            socket.SOCK_STREAM
-        )
-
-
-        # Timeout allows the program to remain responsive
-        client_socket.settimeout(2)
-
 
         try:
 
-            client_socket.connect(
-                (
-                    ESP32_IP,
-                    ESP32_PORT
-                )
+            serial_connection = serial.Serial(
+                SERIAL_PORT,
+                BAUD_RATE,
+                timeout=1
             )
 
+            # Give the ESP32 a moment after opening the port.
+            time.sleep(2)
+
+            # Clear old/stale serial data.
+            serial_connection.reset_input_buffer()
+            serial_connection.reset_output_buffer()
 
             print(
-                "\nConnected to ESP32 successfully."
+                "\nConnected to ESP32 successfully through USB."
             )
 
             print(
-                "Receiving RH IMU data at 128 Hz."
+                "Receiving RH IMU data at approximately 128 Hz."
+            )
+
+            print(
+                "Normal laptop Wi-Fi can now be used for Firebase."
             )
 
             print(
                 "ML pipeline is now running."
             )
 
-
         except (
-            socket.timeout,
-            ConnectionRefusedError,
+            serial.SerialException,
             OSError
         ) as e:
 
             print("\n")
-
+            print("=" * 70)
+            print(
+                "ESP32 USB SERIAL CONNECTION FAILED"
+            )
             print("=" * 70)
 
             print(
-                "ESP32 WIFI CONNECTION FAILED"
-            )
-
-            print("=" * 70)
-
-            print(
-                "\nCould not connect to:"
+                "\nCould not open:"
             )
 
             print(
-                f"  {ESP32_IP}:{ESP32_PORT}"
+                f"  {SERIAL_PORT} @ {BAUD_RATE} baud"
             )
 
             print(
@@ -1416,19 +1385,19 @@ def main():
             )
 
             print(
-                "  2. Laptop is connected to ESP32_REHAB Wi-Fi."
+                "  2. ESP32 is connected to the laptop by USB."
             )
 
             print(
-                "  3. ESP32 is running the Wi-Fi code."
+                f"  3. The correct COM port is {SERIAL_PORT}."
             )
 
             print(
-                "  4. IP address is 192.168.4.1."
+                "  4. Arduino Serial Monitor is closed."
             )
 
             print(
-                "  5. TCP port is 5000."
+                "  5. Arduino code uses Serial.begin(115200)."
             )
 
             print(
@@ -1436,10 +1405,7 @@ def main():
                 e
             )
 
-            client_socket.close()
-
             return
-
 
         try:
 
@@ -1450,13 +1416,11 @@ def main():
                     f"{WINDOW_SECONDS}-second RH window..."
                 )
 
-
                 rh_window = (
                     get_rh_window(
-                        client_socket
+                        serial_connection
                     )
                 )
-
 
                 if (
                     rh_window.empty
@@ -1471,12 +1435,52 @@ def main():
 
                     continue
 
-
-                process_window(
+                ml_result = process_window(
                     rh_window,
-                    client_socket
+                    serial_connection
                 )
 
+                latest_sample = rh_window.iloc[-1]
+
+                try:
+
+                    telemetry_id = write_telemetry(
+                        PATIENT_ID,
+                        DEVICE_ID,
+                        latest_sample["Time"],
+                        latest_sample["Accel X"],
+                        latest_sample["Accel Y"],
+                        latest_sample["Accel Z"],
+                        latest_sample["Gyro X"],
+                        latest_sample["Gyro Y"],
+                        latest_sample["Gyro Z"],
+                        ml_result
+                    )
+
+                    print(
+                        "Firebase telemetry written successfully!"
+                    )
+
+                    print(
+                        f"Telemetry document ID: {telemetry_id}"
+                    )
+
+                except Exception as e:
+
+                    # Do not stop the real-time ML/ESP32 loop
+                    # just because Firebase/internet is unavailable.
+                    print(
+                        "\nFirebase telemetry write failed:"
+                    )
+
+                    print(
+                        " ",
+                        e
+                    )
+
+                    print(
+                        "ML and ESP32 communication will continue."
+                    )
 
         except KeyboardInterrupt:
 
@@ -1484,29 +1488,29 @@ def main():
                 "\nStopping pipeline..."
             )
 
-
         except ConnectionError as e:
 
             print(
-                "\nESP32 connection lost:",
+                "\nESP32 USB connection lost:",
                 e
             )
 
-
-        except OSError as e:
+        except serial.SerialException as e:
 
             print(
-                "\nNetwork error:",
+                "\nUSB serial error:",
                 e
             )
-
 
         finally:
 
-            client_socket.close()
+            try:
+                serial_connection.close()
+            except Exception:
+                pass
 
             print(
-                "Wi-Fi connection closed."
+                "USB serial connection closed."
             )
 
 
